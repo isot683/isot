@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+import json
 from telethon import TelegramClient
 from telethon.tl.functions.messages import SaveDraftRequest
 from telethon.tl.functions.users import GetFullUserRequest
@@ -31,7 +32,12 @@ class TelegramDraftSender:
         self.connection_timeout = 30
         
         self.client = None
-        self.stats = {'sent': 0, 'failed': 0, 'skipped': 0}
+        self.stats = {'sent': 0, 'failed': 0, 'skipped': 0, 'blacklisted': 0}
+        
+        # Merkezi blacklist dosya yolu (telefon numarasına özel değil)
+        self.blacklist_file = os.path.join(self.data_dir, "global_blacklist.json")
+        self.blacklist = set()
+        self.load_blacklist()  # Program başında blacklist'i yükle
         
         # Graceful shutdown için signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -46,6 +52,82 @@ class TelegramDraftSender:
             print(f"⚠ Data dizini oluşturulamadı: {e}")
             self.data_dir = os.path.expanduser("~/telegram_drafts")
             os.makedirs(self.data_dir, exist_ok=True)
+    
+    def setup_blacklist_file(self):
+        """Blacklist dosyası zaten __init__'te ayarlandı - gereksiz"""
+        pass
+    
+    def load_blacklist(self):
+        """Blacklist'i dosyadan yükle"""
+        try:
+            if os.path.exists(self.blacklist_file):
+                with open(self.blacklist_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.blacklist = set(data.get('user_ids', []))
+                    self.log_progress(f"Global Blacklist yüklendi: {len(self.blacklist)} kullanıcı", "SUCCESS")
+            else:
+                self.blacklist = set()
+                self.log_progress("Yeni Global Blacklist oluşturuldu", "INFO")
+        except Exception as e:
+            self.log_progress(f"Blacklist yüklenemedi: {e}", "WARNING")
+            self.blacklist = set()
+    
+    def save_blacklist(self):
+        """Blacklist'i dosyaya kaydet"""
+        try:
+            blacklist_data = {
+                'user_ids': list(self.blacklist),
+                'last_updated': datetime.now().isoformat(),
+                'total_count': len(self.blacklist)
+            }
+            
+            with open(self.blacklist_file, 'w', encoding='utf-8') as f:
+                json.dump(blacklist_data, f, ensure_ascii=False, indent=2)
+            
+            self.log_progress(f"Global Blacklist kaydedildi: {len(self.blacklist)} kullanıcı", "SUCCESS")
+        except Exception as e:
+            self.log_progress(f"Global Blacklist kaydedilemedi: {e}", "ERROR")
+    
+    def add_to_blacklist(self, user_id):
+        """Kullanıcıyı blacklist'e ekle"""
+        self.blacklist.add(user_id)
+    
+    def is_blacklisted(self, user_id):
+        """Kullanıcının blacklist'te olup olmadığını kontrol et"""
+        return user_id in self.blacklist
+    
+    def show_blacklist_stats(self):
+        """Blacklist istatistiklerini göster"""
+        if self.blacklist_file and os.path.exists(self.blacklist_file):
+            try:
+                with open(self.blacklist_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    last_updated = data.get('last_updated', 'Bilinmiyor')
+                    
+                print(f"\n🚫 Global Blacklist İstatistikleri:")
+                print(f"📊 Toplam engellenen kullanıcı: {len(self.blacklist)}")
+                print(f"🕒 Son güncelleme: {last_updated}")
+                print(f"📍 Dosya konumu: {self.blacklist_file}")
+                
+            except Exception as e:
+                self.log_progress(f"Blacklist stats okunamadı: {e}", "WARNING")
+    
+    def clear_blacklist_option(self):
+        """Blacklist temizleme seçeneği"""
+        if len(self.blacklist) > 0:
+            print(f"\n🚫 Mevcut Global Blacklist: {len(self.blacklist)} kullanıcı")
+            print("⚠ Bu liste TÜM telefon numaraları için geçerlidir!")
+            while True:
+                clear = input("Global Blacklist'i temizlemek ister misiniz? (e/h): ").strip().lower()
+                if clear in ['e', 'evet', 'y', 'yes']:
+                    self.blacklist.clear()
+                    self.save_blacklist()
+                    self.log_progress("Global Blacklist temizlendi", "SUCCESS")
+                    break
+                elif clear in ['h', 'hayır', 'n', 'no']:
+                    break
+                else:
+                    print("❌ 'e' veya 'h' girin!")
     
     def signal_handler(self, signum, frame):
         """Graceful shutdown"""
@@ -83,6 +165,10 @@ class TelegramDraftSender:
                 break
             else:
                 print("❌ Geçersiz format! Örnek: +905535350731")
+        
+        # Blacklist durumunu göster (telefon numarasından bağımsız)
+        self.show_blacklist_stats()
+        self.clear_blacklist_option()
         
         # Grup URL'si
         while True:
@@ -137,6 +223,7 @@ class TelegramDraftSender:
         print(f"💬 Mesaj: '{self.draft_message}'")
         print(f"🎯 Hedef: {self.target_user_count} kullanıcı")
         print(f"⏱ Tepki kontrolü: {'Açık' if self.check_reaction_time else 'Kapalı'}")
+        print(f"🚫 Global Blacklist: {len(self.blacklist)} kullanıcı")
         
         while True:
             confirm = input("\n✅ Bu ayarlarla devam edilsin mi? (e/h): ").strip().lower()
@@ -212,6 +299,11 @@ class TelegramDraftSender:
     
     async def should_send_to_user(self, user, message_date):
         """Kullanıcıya mesaj gönderilip gönderilmeyeceğini kontrol et"""
+        # Önce blacklist kontrolü
+        if self.is_blacklisted(user.id):
+            self.stats['blacklisted'] += 1
+            return False
+            
         if not self.check_reaction_time:
             return True
         
@@ -248,6 +340,7 @@ class TelegramDraftSender:
             processed_messages = 0
             
             self.log_progress(f"Hedef kullanıcı sayısı: {self.target_user_count}")
+            self.log_progress(f"Global Blacklist'te {len(self.blacklist)} kullanıcı var")
             
             while len(unique_users) < self.target_user_count:
                 messages = await self.client.get_messages(
@@ -294,7 +387,7 @@ class TelegramDraftSender:
                 
                 # Progress update
                 if processed_messages % 50 == 0:
-                    self.log_progress(f"İşlenen mesaj: {processed_messages}, Bulunan kullanıcı: {len(unique_users)}")
+                    self.log_progress(f"İşlenen mesaj: {processed_messages}, Bulunan kullanıcı: {len(unique_users)}, Global Blacklist'te: {self.stats['blacklisted']}")
                 
                 await asyncio.sleep(1)
             
@@ -316,6 +409,8 @@ class TelegramDraftSender:
                 no_webpage=False
             ))
             
+            # Başarılı gönderimde blacklist'e ekle
+            self.add_to_blacklist(user_id)
             self.stats['sent'] += 1
             return True
             
@@ -325,13 +420,14 @@ class TelegramDraftSender:
     
     def print_stats(self):
         """İstatistikleri göster"""
-        total = self.stats['sent'] + self.stats['failed'] + self.stats['skipped']
+        total = self.stats['sent'] + self.stats['failed'] + self.stats['skipped'] + self.stats['blacklisted']
         if total > 0:
             success_rate = (self.stats['sent'] / total) * 100
             print(f"\n📊 İstatistikler:")
             print(f"✓ Başarılı: {self.stats['sent']}")
             print(f"✗ Başarısız: {self.stats['failed']}")
             print(f"⏭ Atlanan: {self.stats['skipped']}")
+            print(f"🚫 Global Blacklist: {self.stats['blacklisted']}")
             print(f"📈 Başarı oranı: {success_rate:.1f}%")
     
     async def process_users(self, users):
@@ -355,15 +451,18 @@ class TelegramDraftSender:
                     if current % 10 == 0 or current == total_users:
                         self.log_progress(f"İlerleme: {current}/{total_users} - Başarılı: {success_count}")
                     
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.5)
                     
                 except Exception:
                     continue
             
             # Batch arası dinlenme
             if i + self.batch_size < total_users:
-                self.log_progress(f"Batch tamamlandı, 5 saniye bekleniyor...")
-                await asyncio.sleep(5)
+                self.log_progress(f"Batch tamamlandı, 3 saniye bekleniyor...")
+                await asyncio.sleep(3)
+        
+        # Global Blacklist'i kaydet
+        self.save_blacklist()
         
         self.log_progress(f"İşlem tamamlandı: {success_count}/{total_users} başarılı", "SUCCESS")
     
@@ -375,6 +474,11 @@ class TelegramDraftSender:
                 self.log_progress("Client bağlantısı kapatıldı", "SUCCESS")
             except:
                 pass
+        
+        # Final global blacklist save
+        if hasattr(self, 'blacklist_file') and self.blacklist_file:
+            self.save_blacklist()
+            
         self.print_stats()
     
     async def run(self):
@@ -401,7 +505,6 @@ class TelegramDraftSender:
                 self.log_progress("Yeterli kullanıcı bulunamadı!", "WARNING")
                 return
             
-            # Draft'ları gönder
             await self.process_users(users)
             
             self.log_progress("Tüm işlemler tamamlandı! 🎉", "SUCCESS")
@@ -424,8 +527,8 @@ def check_requirements():
         return False
 
 async def main():
-    print("🤖 Telegram Draft Sender - Interactive")
-    print("=" * 40)
+    print("🤖 Telegram Draft Sender - Interactive (Blacklist Edition)")
+    print("=" * 50)
     
     if not check_requirements():
         return
@@ -434,6 +537,12 @@ async def main():
     print("1. pkg update && pkg upgrade")
     print("2. pkg install python")
     print("3. pip install telethon")
+    
+    print("\n🚫 Global Blacklist Özellikleri:")
+    print("• Gönderilen kullanıcılar merkezi bir dosyada kaydedilir")
+    print("• Hangi telefon numarası kullanılırsa kullanılsın aynı liste")
+    print("• Bir daha HİÇBİR telefon numarasıyla gönderim yapılmaz")
+    print("• Tüm hesaplar için ortak koruma sağlar")
     
     input("\n📱 Devam etmek için Enter'a basın...")
     
