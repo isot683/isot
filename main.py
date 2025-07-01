@@ -21,7 +21,7 @@ class TelegramDraftSender:
         
         # Kullanıcıdan alınacak bilgiler
         self.phone_number = None
-        self.group_url = None
+        self.group_identifier = None  # URL veya grup ismi
         self.draft_message = None
         self.target_user_count = 45
         self.check_reaction_time = True
@@ -170,14 +170,17 @@ class TelegramDraftSender:
         self.show_blacklist_stats()
         self.clear_blacklist_option()
         
-        # Grup URL'si
+        # Grup URL'si veya ismi - GÜNCELLENDİ
         while True:
-            group = input("📢 Grup URL'sini girin (https://t.me/grupadi): ").strip()
-            if 't.me/' in group:
-                self.group_url = group
+            group = input("📢 Grup URL'sini veya grup ismini girin:\n" + 
+                         "   URL için: https://t.me/grupadi\n" +
+                         "   İsim için: Grup Adı\n" +
+                         "   Giriş: ").strip()
+            if group:
+                self.group_identifier = group
                 break
             else:
-                print("❌ Geçersiz format! Örnek: https://t.me/busralgotrade")
+                print("❌ Boş bırakılamaz!")
         
         # Draft mesajı
         while True:
@@ -216,10 +219,13 @@ class TelegramDraftSender:
             else:
                 print("❌ 'e' veya 'h' girin!")
         
+        # Grup türü belirleme
+        group_type = "URL" if ('t.me/' in self.group_identifier or 'telegram.me/' in self.group_identifier) else "İsim"
+        
         # Özet göster
         print(f"\n📋 Ayarlar Özeti:")
         print(f"📞 Telefon: {self.phone_number}")
-        print(f"📢 Grup: {self.group_url}")
+        print(f"📢 Grup ({group_type}): {self.group_identifier}")
         print(f"💬 Mesaj: '{self.draft_message}'")
         print(f"🎯 Hedef: {self.target_user_count} kullanıcı")
         print(f"⏱ Tepki kontrolü: {'Açık' if self.check_reaction_time else 'Kapalı'}")
@@ -270,15 +276,51 @@ class TelegramDraftSender:
             return False
     
     async def get_group_entity(self):
-        """Grup entity alma"""
+        """Grup entity alma - URL ve isim desteği"""
         try:
-            if 't.me/' in self.group_url:
-                username = self.group_url.split('t.me/')[-1]
+            # URL kontrolü
+            if 't.me/' in self.group_identifier or 'telegram.me/' in self.group_identifier:
+                # URL'den username çıkar
+                if 't.me/' in self.group_identifier:
+                    username = self.group_identifier.split('t.me/')[-1]
+                else:
+                    username = self.group_identifier.split('telegram.me/')[-1]
+                
+                # URL parametrelerini temizle
+                username = username.split('?')[0].split('#')[0]
+                
+                self.log_progress(f"URL'den grup aranıyor: @{username}", "INFO")
                 entity = await self.client.get_entity(username)
-                self.log_progress(f"Grup bulundu: {entity.title}", "SUCCESS")
-                return entity
+                
+            else:
+                # Grup ismi ile arama
+                self.log_progress(f"İsimle grup aranıyor: {self.group_identifier}", "INFO")
+                
+                # Önce dialogları kontrol et
+                async for dialog in self.client.iter_dialogs():
+                    if (dialog.title and 
+                        self.group_identifier.lower() in dialog.title.lower() and
+                        dialog.is_group):
+                        
+                        self.log_progress(f"Grup bulundu (dialog): {dialog.title}", "SUCCESS")
+                        return dialog.entity
+                
+                # Dialog'da bulunamadıysa direkt entity olarak dene
+                entity = await self.client.get_entity(self.group_identifier)
+            
+            self.log_progress(f"Grup bulundu: {entity.title}", "SUCCESS")
+            return entity
+            
         except Exception as e:
             self.log_progress(f"Grup bulunamadı: {e}", "ERROR")
+            
+            # Alternatif arama önerileri
+            if 't.me/' not in self.group_identifier and 'telegram.me/' not in self.group_identifier:
+                self.log_progress("💡 Öneriler:", "INFO")
+                self.log_progress("• Grup ismini tam olarak yazın", "INFO")
+                self.log_progress("• Grubun herkese açık olduğundan emin olun", "INFO")
+                self.log_progress("• Grup URL'sini kullanmayı deneyin", "INFO")
+            
             return None
     
     async def get_user_online_status(self, user_id):
@@ -527,7 +569,7 @@ def check_requirements():
         return False
 
 async def main():
-    print("🤖 Telegram Draft Sender - Interactive (Blacklist Edition)")
+    print("🤖 Telegram Draft Sender - Flexible Group Support")
     print("=" * 50)
     
     if not check_requirements():
@@ -537,6 +579,11 @@ async def main():
     print("1. pkg update && pkg upgrade")
     print("2. pkg install python")
     print("3. pip install telethon")
+    
+    print("\n📢 Grup Desteği:")
+    print("• Herkese açık gruplar: https://t.me/grupadi")
+    print("• Gizli/Özel gruplar: Grup ismini yazın")
+    print("• Üye olduğunuz gruplar: Tam ismi yazın")
     
     print("\n🚫 Global Blacklist Özellikleri:")
     print("• Gönderilen kullanıcılar merkezi bir dosyada kaydedilir")
