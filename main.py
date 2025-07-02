@@ -1,3 +1,4 @@
+
 #!/data/data/com.termux/files/usr/bin/python3
 import asyncio
 import os
@@ -6,6 +7,9 @@ import json
 from telethon import TelegramClient
 from telethon.tl.functions.messages import SaveDraftRequest
 from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
+from telethon.errors import UserPrivacyRestrictedError, UserBlockedError, PeerFloodError
 from datetime import datetime, timezone
 import signal
 
@@ -25,6 +29,8 @@ class TelegramDraftSender:
         self.draft_message = None
         self.target_user_count = 45
         self.check_reaction_time = True
+        self.skip_admins = True  # Yöneticileri atla
+        self.include_message_senders = True  # YENİ: Mesaj gönderenleri dahil et
         
         # Termux optimizasyonları
         self.batch_size = 20
@@ -32,7 +38,17 @@ class TelegramDraftSender:
         self.connection_timeout = 30
         
         self.client = None
-        self.stats = {'sent': 0, 'failed': 0, 'skipped': 0, 'blacklisted': 0}
+        self.stats = {
+            'sent': 0, 
+            'failed': 0, 
+            'skipped': 0, 
+            'blacklisted': 0,
+            'admin_skipped': 0,  # Yönetici olduğu için atlanan
+            'blocked_skipped': 0,  # Engelleme nedeniyle atlanan
+            'privacy_restricted': 0,  # Gizlilik ayarları nedeniyle atlanan
+            'reaction_users': 0,  # Tepki veren kullanıcılar
+            'message_senders': 0  # Mesaj gönderen kullanıcılar
+        }
         
         # Merkezi blacklist dosya yolu (telefon numarasına özel değil)
         self.blacklist_file = os.path.join(self.data_dir, "global_blacklist.json")
@@ -152,6 +168,50 @@ class TelegramDraftSender:
         except:
             pass
     
+    async def is_user_admin(self, group_entity, user_id):
+        """Kullanıcının grup yöneticisi olup olmadığını kontrol et"""
+        try:
+            participant = await self.client(GetParticipantRequest(
+                channel=group_entity,
+                participant=user_id
+            ))
+            
+            # Yönetici veya grup sahibi mi kontrol et
+            is_admin = isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator))
+            
+            if is_admin:
+                self.log_progress(f"Yönetici tespit edildi: {user_id}", "INFO")
+            
+            return is_admin
+            
+        except Exception as e:
+            # Hata durumunda false döndür (normal kullanıcı varsay)
+            return False
+    
+    async def can_send_message_to_user(self, user_id):
+        """Kullanıcıya mesaj gönderilip gönderilemeyeceğini kontrol et"""
+        try:
+            # Kullanıcının tam bilgilerini al
+            full_user = await self.client(GetFullUserRequest(user_id))
+            user = full_user.users[0]
+            
+            # Kullanıcı beni engellemiş mi?
+            if hasattr(user, 'blocked') and user.blocked:
+                return False, "user_blocked_me"
+            
+            # Ben kullanıcıyı engellemiş miyim?
+            if hasattr(full_user.full_user, 'blocked') and full_user.full_user.blocked:
+                return False, "i_blocked_user"
+            
+            # Gizlilik ayarları kontrolü - basit bir test mesajı ile
+            # Bu kısım sadece kontrol amaçlı, gerçek mesaj gönderimi yapılmıyor
+            return True, "can_send"
+            
+        except UserBlockedError:
+            return False, "user_blocked_me"
+        except Exception as e:
+            return True, "unknown_error"
+    
     def get_user_input(self):
         """Kullanıcıdan bilgileri al"""
         print("\n📱 Telegram Draft Sender Ayarları")
@@ -207,6 +267,18 @@ class TelegramDraftSender:
             except ValueError:
                 print("❌ Geçerli bir sayı girin!")
         
+        # Mesaj gönderenleri dahil etme kontrolü - YENİ
+        while True:
+            include_senders = input("📝 Mesaj gönderen kullanıcılar da dahil edilsin mi? (e/h, varsayılan: e): ").strip().lower()
+            if include_senders in ['h', 'hayır', 'n', 'no']:
+                self.include_message_senders = False
+                break
+            elif include_senders in ['', 'e', 'evet', 'y', 'yes']:
+                self.include_message_senders = True
+                break
+            else:
+                print("❌ 'e' veya 'h' girin!")
+        
         # Tepki süresi kontrolü
         while True:
             check = input("⏱ Tepki süresi kontrolü yapılsın mı? (e/h, varsayılan: e): ").strip().lower()
@@ -215,6 +287,18 @@ class TelegramDraftSender:
                 break
             elif check in ['', 'e', 'evet', 'y', 'yes']:
                 self.check_reaction_time = True
+                break
+            else:
+                print("❌ 'e' veya 'h' girin!")
+        
+        # Yönetici atlama kontrolü
+        while True:
+            skip_admin = input("👑 Grup yöneticileri atlanسın mı? (e/h, varsayılan: e): ").strip().lower()
+            if skip_admin in ['h', 'hayır', 'n', 'no']:
+                self.skip_admins = False
+                break
+            elif skip_admin in ['', 'e', 'evet', 'y', 'yes']:
+                self.skip_admins = True
                 break
             else:
                 print("❌ 'e' veya 'h' girin!")
@@ -228,7 +312,9 @@ class TelegramDraftSender:
         print(f"📢 Grup ({group_type}): {self.group_identifier}")
         print(f"💬 Mesaj: '{self.draft_message}'")
         print(f"🎯 Hedef: {self.target_user_count} kullanıcı")
+        print(f"📝 Mesaj gönderenler: {'Dahil' if self.include_message_senders else 'Hariç'}")
         print(f"⏱ Tepki kontrolü: {'Açık' if self.check_reaction_time else 'Kapalı'}")
+        print(f"👑 Yönetici atlama: {'Açık' if self.skip_admins else 'Kapalı'}")
         print(f"🚫 Global Blacklist: {len(self.blacklist)} kullanıcı")
         
         while True:
@@ -339,21 +425,38 @@ class TelegramDraftSender:
         except Exception:
             return None
     
-    async def should_send_to_user(self, user, message_date):
+    async def should_send_to_user(self, user, message_date, group_entity):
         """Kullanıcıya mesaj gönderilip gönderilmeyeceğini kontrol et"""
         # Önce blacklist kontrolü
         if self.is_blacklisted(user.id):
             self.stats['blacklisted'] += 1
-            return False
-            
+            return False, "blacklisted"
+        
+        # Yönetici kontrolü
+        if self.skip_admins:
+            if await self.is_user_admin(group_entity, user.id):
+                self.stats['admin_skipped'] += 1
+                return False, "admin"
+        
+        # Engelleme durumu kontrolü
+        can_send, reason = await self.can_send_message_to_user(user.id)
+        if not can_send:
+            if reason == "user_blocked_me":
+                self.stats['blocked_skipped'] += 1
+                return False, "user_blocked_me"
+            elif reason == "i_blocked_user":
+                self.stats['blocked_skipped'] += 1
+                return False, "i_blocked_user"
+        
+        # Tepki süresi kontrolü
         if not self.check_reaction_time:
-            return True
+            return True, "ok"
         
         try:
             last_online = await self.get_user_online_status(user.id)
             
             if last_online is None:
-                return True
+                return True, "ok"
             
             # Timezone aware datetime'ları karşılaştır
             if message_date.tzinfo is None:
@@ -366,15 +469,15 @@ class TelegramDraftSender:
             
             if time_diff <= 60:
                 self.stats['skipped'] += 1
-                return False
+                return False, "reaction_time"
             
-            return True
+            return True, "ok"
             
         except Exception:
-            return True
+            return True, "ok"
     
-    async def get_reaction_users(self, group_entity):
-        """Tepki veren kullanıcıları topla"""
+    async def get_active_users(self, group_entity):
+        """Tepki veren ve mesaj gönderen kullanıcıları topla - GÜNCELLENDİ"""
         try:
             unique_users = set()
             processed_users = []
@@ -383,6 +486,8 @@ class TelegramDraftSender:
             
             self.log_progress(f"Hedef kullanıcı sayısı: {self.target_user_count}")
             self.log_progress(f"Global Blacklist'te {len(self.blacklist)} kullanıcı var")
+            self.log_progress(f"Yönetici atlama: {'Açık' if self.skip_admins else 'Kapalı'}")
+            self.log_progress(f"Mesaj gönderenler dahil: {'Evet' if self.include_message_senders else 'Hayır'}")
             
             while len(unique_users) < self.target_user_count:
                 messages = await self.client.get_messages(
@@ -398,6 +503,25 @@ class TelegramDraftSender:
                 for message in messages:
                     processed_messages += 1
                     
+                    # 1. Mesaj gönderenleri dahil et (YENİ)
+                    if self.include_message_senders and message.sender_id:
+                        try:
+                            if message.sender_id not in unique_users:
+                                sender = await self.client.get_entity(message.sender_id)
+                                should_send, reason = await self.should_send_to_user(sender, message.date, group_entity)
+                                if should_send:
+                                    unique_users.add(sender.id)
+                                    processed_users.append(sender)
+                                    self.stats['message_senders'] += 1
+                                    
+                                    if len(unique_users) >= self.target_user_count:
+                                        self.log_progress(f"Hedef sayıya ulaşıldı: {len(unique_users)}", "SUCCESS")
+                                        return processed_users[:self.target_user_count]
+                                    
+                        except Exception:
+                            pass
+                    
+                    # 2. Tepki verenleri dahil et (MEVCUT)
                     if message.reactions and message.reactions.results:
                         for reaction in message.reactions.results:
                             try:
@@ -412,9 +536,11 @@ class TelegramDraftSender:
                                 
                                 for user in reaction_users.users:
                                     if user.id not in unique_users:
-                                        if await self.should_send_to_user(user, message.date):
+                                        should_send, reason = await self.should_send_to_user(user, message.date, group_entity)
+                                        if should_send:
                                             unique_users.add(user.id)
                                             processed_users.append(user)
+                                            self.stats['reaction_users'] += 1
                                             
                                             if len(unique_users) >= self.target_user_count:
                                                 self.log_progress(f"Hedef sayıya ulaşıldı: {len(unique_users)}", "SUCCESS")
@@ -429,11 +555,17 @@ class TelegramDraftSender:
                 
                 # Progress update
                 if processed_messages % 50 == 0:
-                    self.log_progress(f"İşlenen mesaj: {processed_messages}, Bulunan kullanıcı: {len(unique_users)}, Global Blacklist'te: {self.stats['blacklisted']}")
+                    total_skipped = (self.stats['blacklisted'] + self.stats['admin_skipped'] + 
+                                   self.stats['blocked_skipped'] + self.stats['skipped'])
+                    self.log_progress(f"İşlenen mesaj: {processed_messages}, Bulunan: {len(unique_users)}, "
+                                    f"Atlanan: {total_skipped} (Tepki: {self.stats['reaction_users']}, "
+                                    f"Mesaj: {self.stats['message_senders']}, Blacklist: {self.stats['blacklisted']}, "
+                                    f"Yönetici: {self.stats['admin_skipped']})")
                 
                 await asyncio.sleep(1)
             
             self.log_progress(f"Toplam {len(processed_users)} benzersiz kullanıcı bulundu")
+            self.log_progress(f"Tepki veren: {self.stats['reaction_users']}, Mesaj gönderen: {self.stats['message_senders']}")
             return processed_users
             
         except Exception as e:
@@ -455,22 +587,36 @@ class TelegramDraftSender:
             self.add_to_blacklist(user_id)
             self.stats['sent'] += 1
             return True
-            
+        except UserBlockedError:
+            self.stats['blocked_skipped'] += 1
+            return False
+        except PeerFloodError:
+            self.log_progress("Flood limit! 30 saniye bekleniyor...", "WARNING")
+            await asyncio.sleep(30)
+            self.stats['failed'] += 1
+            return False
         except Exception:
             self.stats['failed'] += 1
             return False
     
     def print_stats(self):
         """İstatistikleri göster"""
-        total = self.stats['sent'] + self.stats['failed'] + self.stats['skipped'] + self.stats['blacklisted']
+        total = (self.stats['sent'] + self.stats['failed'] + self.stats['skipped'] + 
+                self.stats['blacklisted'] + self.stats['admin_skipped'] + 
+                self.stats['blocked_skipped'])
+        
         if total > 0:
             success_rate = (self.stats['sent'] / total) * 100
-            print(f"\n📊 İstatistikler:")
-            print(f"✓ Başarılı: {self.stats['sent']}")
-            print(f"✗ Başarısız: {self.stats['failed']}")
-            print(f"⏭ Atlanan: {self.stats['skipped']}")
-            print(f"🚫 Global Blacklist: {self.stats['blacklisted']}")
+            print(f"\n📊 Detaylı İstatistikler:")
+            print(f"✓ Başarılı gönderim: {self.stats['sent']}")
+            print(f"✗ Başarısız gönderim: {self.stats['failed']}")
+            print(f"📝 Mesaj gönderenler: {'Dahil' if self.include_message_senders else 'Hariç'}")
+            print(f"⏭ Tepki süresi nedeniyle atlanan: {self.stats['skipped']}")
+            print(f"🚫 Global Blacklist nedeniyle atlanan: {self.stats['blacklisted']}")
+            print(f"👑 Yönetici olduğu için atlanan: {self.stats['admin_skipped']}")
+            print(f"🔒 Engelleme nedeniyle atlanan: {self.stats['blocked_skipped']}")
             print(f"📈 Başarı oranı: {success_rate:.1f}%")
+            print(f"📊 Toplam işlem: {total}")
     
     async def process_users(self, users):
         """Kullanıcılara draft gönder"""
