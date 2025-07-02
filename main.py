@@ -45,7 +45,6 @@ class TelegramDraftSender:
             'blacklisted': 0,
             'admin_skipped': 0,  # Yönetici olduğu için atlanan
             'blocked_skipped': 0,  # Engelleme nedeniyle atlanan
-            'privacy_restricted': 0,  # Gizlilik ayarları nedeniyle atlanan
             'reaction_users': 0,  # Tepki veren kullanıcılar
             'message_senders': 0  # Mesaj gönderen kullanıcılar
         }
@@ -203,8 +202,6 @@ class TelegramDraftSender:
             if hasattr(full_user.full_user, 'blocked') and full_user.full_user.blocked:
                 return False, "i_blocked_user"
             
-            # Gizlilik ayarları kontrolü - basit bir test mesajı ile
-            # Bu kısım sadece kontrol amaçlı, gerçek mesaj gönderimi yapılmıyor
             return True, "can_send"
             
         except UserBlockedError:
