@@ -685,7 +685,7 @@ class TelegramDraftSender:
                 return
             
             # Tepki veren kullanıcıları topla
-            users = await self.get_reaction_users(group_entity)
+            users = await self.get_active_users(group_entity)
             if not users:
                 self.log_progress("Yeterli kullanıcı bulunamadı!", "WARNING")
                 return
